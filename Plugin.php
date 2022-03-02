@@ -1,7 +1,11 @@
 <?php
 namespace Lti;
 
-use Tk\Event\Dispatcher;
+
+use Tk\EventDispatcher\EventDispatcher;
+use Uni\Db\Institution;
+use Uni\Db\InstitutionIface;
+use \IMSGlobal\LTI;
 
 
 /**
@@ -12,33 +16,32 @@ use Tk\Event\Dispatcher;
 class Plugin extends \Tk\Plugin\Iface
 {
 
-    const ZONE_INSTITUTION      = 'institution';
-    const ZONE_COURSE           = 'course';
-    const ZONE_SUBJECT          = 'subject';
+    const ZONE_INSTITUTION          = 'institution';
+    const ZONE_COURSE               = 'course';
+    const ZONE_SUBJECT              = 'subject';
 
-    // Data labels
-    const LTI_STUFF         = 'lti.setting';
-    const LTI_ENABLE        = 'lti.enable';
-    const LTI_KEY           = 'lti.key';
-    const LTI_SECRET        = 'lti.secret';
-    const LTI_URL           = 'lti.url';
-    const LTI_CURRENT_KEY   = 'lti.currentKey';
-    const LTI_CURRENT_ID    = 'lti.currentId';
+    // Plugin/Tool LTI Settings
+    const LTI_TOOL_KEY_PUBLIC       = 'lti.cert.pub';
+    const LTI_TOOL_KEY_PRIVATE      = 'lti.cert.prv';
+
+    // Institution LTI Settings
+    const LTI_ENABLE                = 'lti.enable';
+    const LTI_LMS_PLATFORMID        = 'lti.lms.platform_id';        // This will usually look something like 'http://example.com'
+    const LTI_LMS_CLIENTID          = 'lti.lms.client_id';          // This is the id received in the 'aud' during a launch
+    const LTI_LMS_AUTHLOGINURL      = 'lti.lms.auth_login_url';     // The platform's OIDC login endpoint
+    const LTI_LMS_AUTHTOKENURL      = 'lti.lms.auth_token_url';     // The platform's service authorization endpoint
+    const LTI_LMS_KEYSETURL         = 'lti.lms.key_set_url';        // The platform's JWKS endpoint
+    const LTI_LMS_DEPLOYMENTID      = 'lti.lms.deployment_id';      // The deployment_id passed by the platform during launch
+    //const LTI_LMS_PRIVATEKEYFILE    = 'lti.lms.private_key_file';   // Relative path to the tool's private key
+
+    const LTI_LAUNCH = 'lti_launch';
+    //const LTI_SUBJECT_ID = 'custom_subjectid';
+
 
     /**
      * @var string
      */
     public static $LTI_DB_PREFIX = '_';
-
-    /**
-     * @var \IMSGlobal\LTI\ToolProvider\DataConnector\DataConnector_pdo
-     */
-    public static $dataConnector = null;
-
-    /**
-     * @var \IMSGlobal\LTI\ToolProvider\ToolConsumer
-     */
-    public static $ltiConsumer= null;
 
     /**
      * @var \Tk\Db\Data
@@ -57,63 +60,15 @@ class Plugin extends \Tk\Plugin\Iface
     }
 
     /**
-     * getRequest
-     * @return \IMSGlobal\LTI\ToolProvider\DataConnector\DataConnector_pdo
-     */
-    public static function getLtiDataConnector()
-    {
-        if (!self::$dataConnector) {
-            self::$dataConnector = \IMSGlobal\LTI\ToolProvider\DataConnector\DataConnector::getDataConnector(self::$LTI_DB_PREFIX,
-                \Uni\Config::getInstance()->getDb(), 'pdo');
-        }
-        return self::$dataConnector;
-    }
-
-    /**
      * @param \Uni\Db\InstitutionIface $institution
      * @return \Tk\Db\Data
      * @throws \Exception
      */
-    public static function getInstitutionData($institution)
+    public function getInstitutionData($institution = null)
     {
-        \Uni\Config::getInstance()->set('institution', $institution);
+        if (!$institution) $institution = \Uni\Config::getInstance()->getInstitution();
+        $this->getConfig()->set('institution', $institution);
         return self::$institutionData = \Tk\Db\Data::create(self::getInstance()->getName() . '.institution', $institution->getId());
-    }
-
-    /**
-     * @param \Uni\Db\InstitutionIface $institution
-     * @return \IMSGlobal\LTI\ToolProvider\ToolConsumer
-     * @throws \Exception
-     */
-    public static function getLtiConsumer($institution)
-    {
-        $data = self::getInstitutionData($institution);
-        $key = $data->get(self::LTI_CURRENT_KEY);
-        if ($key === '') $key = null;
-        if (!self::$ltiConsumer && $key) {
-            self::$ltiConsumer = new \IMSGlobal\LTI\ToolProvider\ToolConsumer($key, self::getLtiDataConnector());
-        }
-        return self::$ltiConsumer;
-    }
-
-
-    /**
-     * Check if the LTI key exists
-     *
-     * @param $consumer_key256
-     * @param int $ignoreId
-     * @return bool
-     * @throws \Tk\Db\Exception
-     */
-    public static function ltiKeyExists($consumer_key256, $ignoreId = 0)
-    {
-        $db = \Uni\Config::getInstance()->getDb();
-        $sql = sprintf('SELECT * FROM %s WHERE consumer_key256 = %s',
-            $db->quoteParameter(self::$LTI_DB_PREFIX.'lti2_consumer'), $db->quote($consumer_key256));
-        if ($ignoreId) {
-            $sql .= sprintf(' AND consumer_pk != %s ', (int)$ignoreId);
-        }
-        return ($db->query($sql)->rowCount() > 0);
     }
 
     /**
@@ -121,22 +76,76 @@ class Plugin extends \Tk\Plugin\Iface
      *
      * @param \Uni\Db\InstitutionIface $institution
      * @return bool
-     * @throws \Exception
      */
-    public static function isEnabled($institution)
+    public static function isEnabled($institution = null)
     {
-        $db = \Uni\Config::getInstance()->getDb();
-        if(!$db->hasTable(self::$LTI_DB_PREFIX.'lti2_consumer')) {
-            return false;
-        }
-        $data = self::getInstitutionData($institution);
-        if ($data && $data->has(self::LTI_ENABLE)) {
-            return true;
-        }
-
+        if (!$institution) $institution = \Uni\Config::getInstance()->getInstitution();
+        $plugin = self::getInstance();
+        try {
+            $data = $plugin->getInstitutionData($institution);
+            if ($data && $data->has(self::LTI_ENABLE)) {
+                return true;
+            }
+        } catch (\Exception $e) { \Tk\Log::error($e->__toString()); }
         return false;
     }
 
+    /**
+     * @param string|\Tk\Uri $url
+     * @param InstitutionIface $institution
+     * @return \Tk\Uri
+     */
+    public static function createUrl($url, $institution = null)
+    {
+        if (!$institution) $institution = \Uni\Config::getInstance()->getInstitution();
+        if ($url instanceof \Tk\Uri) {
+            $url = $url->getRelativePath();
+        }
+        $url = \Tk\Uri::create('/lti/'.$institution->getHash().$url);
+        if ($institution->getDomain())
+            $url = \Tk\Uri::create('/lti'.$url)->setHost($institution->getDomain());
+
+        $url->setScheme('https')->toString();
+        return $url;
+    }
+
+    /**
+     * @return array
+     */
+    public static function getJwks()
+    {
+        $data = self::getInstance()->getData();
+        $kid = hash('sha256', $data->get(Plugin::LTI_TOOL_KEY_PUBLIC));
+        $jwks = LTI\JWKS_Endpoint::new([
+            $kid => $data->get(Plugin::LTI_TOOL_KEY_PRIVATE)
+        ]);
+        return $jwks->get_public_jwks();
+    }
+
+    /**
+     * Generate an RSA public private key pair
+     * returns array(
+     *    'public'  => '...',
+     *    'private' => '...'
+     * )
+     * @return array
+     */
+    public function generateKeys()
+    {
+        $config = array(
+            "digest_alg" => "sha512",
+            "private_key_bits" => 4096,
+            "private_key_type" => \OPENSSL_KEYTYPE_RSA,
+        );
+        // Create the private and public key
+        $res = openssl_pkey_new($config);
+        // Extract the private key from $res to $privKey
+        openssl_pkey_export($res, $privKey);
+        // Extract the public key from $res to $pubKey
+        $pubKey = openssl_pkey_get_details($res);
+        $pubKey = $pubKey["key"];
+        return array(Plugin::LTI_TOOL_KEY_PUBLIC => $pubKey, Plugin::LTI_TOOL_KEY_PRIVATE => $privKey);
+    }
 
     // ---- \Tk\Plugin\Iface Interface Methods ----
 
@@ -153,7 +162,8 @@ class Plugin extends \Tk\Plugin\Iface
         include dirname(__FILE__) . '/config.php';
         $config = $this->getConfig();
         $this->getPluginFactory()->registerZonePlugin($this, self::ZONE_INSTITUTION);
-        /** @var Dispatcher $dispatcher */
+
+        /** @var EventDispatcher $dispatcher */
         $dispatcher = $config->getEventDispatcher();
         $dispatcher->addSubscriber(new \Lti\Listener\SetupHandler());
 
@@ -173,7 +183,14 @@ class Plugin extends \Tk\Plugin\Iface
         $config = \Tk\Config::getInstance();
         $db = $this->getConfig()->getDb();
 
-        if (!$db->hasTable('_lti2_consumer')) {
+        if ($this->getData()->has(Plugin::LTI_TOOL_KEY_PRIVATE) && $this->getData()->has(Plugin::LTI_TOOL_KEY_PUBLIC)) {
+            return;
+        }
+        $keys = $this->generateKeys();
+        $this->getData()->replace($keys);
+        $this->getData()->save();
+
+        if (!$db->hasTable('_lti_platform')) {
             $migrate = new \Tk\Util\SqlMigrate($db);
             $migrate->setTempPath($config->getTempPath());
             $migrate->migrate(dirname(__FILE__) . '/sql');
@@ -192,21 +209,14 @@ class Plugin extends \Tk\Plugin\Iface
         $db = $this->getConfig()->getDb();
 
         // Clear the data table of all plugin data
-        $sql = sprintf('DELETE FROM %s WHERE %s LIKE %s', $db->quoteParameter(\Tk\Db\Data::$DB_TABLE), $db->quoteParameter('fkey'),
-            $db->quote($this->getName().'%'));
-        $db->query($sql);
-
-        // Delete all LTI tables.
-        $sql = sprintf("SHOW TABLES LIKE '%slti2\_%%' ", $db->escapeString(Plugin::$LTI_DB_PREFIX));
-        $result = $db->query($sql);
-        foreach ($result->fetchAll(\PDO::FETCH_ASSOC) as $row) {
-            $db->dropTable(current($row));
-        }
+//        $sql = sprintf('DELETE FROM %s WHERE %s LIKE %s', $db->quoteParameter(\Tk\Db\Data::$DB_TABLE), $db->quoteParameter('fkey'),
+//            $db->quote($this->getName().'%'));
+//        $db->query($sql);
 
         // Remove migration track
-        $sql = sprintf('DELETE FROM %s WHERE %s LIKE %s', $db->quoteParameter(\Tk\Util\SqlMigrate::$DB_TABLE), $db->quoteParameter('path'),
-            $db->quote('/plugin/' . $this->getName().'/%'));
-        $db->query($sql);
+//        $sql = sprintf('DELETE FROM %s WHERE %s LIKE %s', $db->quoteParameter(\Tk\Util\SqlMigrate::$DB_TABLE), $db->quoteParameter('path'),
+//            $db->quote('/plugin/' . $this->getName().'/%'));
+//        $db->query($sql);
 
     }
 
@@ -224,6 +234,14 @@ class Plugin extends \Tk\Plugin\Iface
                 return \Bs\Uri::createHomeUrl('/ltiInstitutionSettings.html');
         }
         return null;
+    }
+
+    /**
+     * @return \Tk\Uri|null
+     */
+    public function getSettingsUrl()
+    {
+        return \Bs\Uri::createHomeUrl('/ltiSettings.html');
     }
 
 }
